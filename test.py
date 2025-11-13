@@ -6,12 +6,13 @@ import torchvision.transforms as T
 from torch.utils.data import DataLoader
 
 # --- 설정 ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 128
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(DEVICE)
+BATCH_SIZE = 32
 # NUM_IMAGES 변수 제거 (전체 데이터 사용)
 
 # --- 모델 준비 ---
-model = mobilenet_v3_small(weights=None).to(DEVICE)
+model = mobilenet_v3_small(weights=None).to(DEVICE).half()
 model.eval()  # 추론 모드로 설정
 
 # --- 데이터 준비 (CIFAR10 테스트 세트: 총 10,000개) ---
@@ -26,7 +27,7 @@ print(f"측정 대상: CIFAR-10 테스트 세트 (총 {len(test_dataset)}개 이
 
 # --- GPU 워밍업 ---
 print("GPU 워밍업 중...")
-dummy_input = torch.randn(BATCH_SIZE, 3, 32, 32).to(DEVICE)
+dummy_input = torch.randn(1, 3, 32, 32).to(DEVICE)
 for _ in range(5):
     _ = model(dummy_input)
 
@@ -42,7 +43,7 @@ start_event.record()
 images_processed = 0
 with torch.no_grad(): 
     for images, labels in test_loader:
-        images = images.to(DEVICE)
+        images = images.to(DEVICE).half()
         
         # 모델 연산
         outputs = model(images)
