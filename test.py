@@ -9,10 +9,12 @@ from torch.utils.data import DataLoader
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(DEVICE)
 BATCH_SIZE = 32
-# NUM_IMAGES 변수 제거 (전체 데이터 사용)
+
+torch.backends.cudnn.benchmark = True
 
 # --- 모델 준비 ---
 model = mobilenet_v3_small(weights=None).to(DEVICE).half()
+model = model.to(memory_format=torch.channels_last).half()
 model.eval()  # 추론 모드로 설정
 
 # --- 데이터 준비 (CIFAR10 테스트 세트: 총 10,000개) ---
@@ -43,7 +45,7 @@ start_event.record()
 images_processed = 0
 with torch.no_grad(): 
     for images, labels in test_loader:
-        images = images.to(DEVICE).half()
+        images = images.to(DEVICE, memory_format=torch.channels_last).half()
         
         # 모델 연산
         outputs = model(images)
