@@ -59,6 +59,7 @@ class TensorRTInference:
 
 # --- 데이터 준비 ---
 transform = T.Compose([
+    T.Resize((224, 224)),
     T.ToTensor(),
     T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
