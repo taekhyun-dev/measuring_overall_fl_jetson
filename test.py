@@ -27,7 +27,7 @@ print(f"측정 대상: CIFAR-10 테스트 세트 (총 {len(test_dataset)}개 이
 
 # --- GPU 워밍업 ---
 print("GPU 워밍업 중...")
-dummy_input = torch.randn(1, 3, 32, 32).to(DEVICE)
+dummy_input = torch.randn(1, 3, 32, 32).to(DEVICE).half()
 for _ in range(5):
     _ = model(dummy_input)
 
