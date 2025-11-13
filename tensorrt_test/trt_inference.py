@@ -11,11 +11,11 @@ from torch.utils.data import DataLoader
 # --- 설정 ---
 ENGINE_PATH = "mobilenet_v3_small_fp16.engine"
 BATCH_SIZE = 32
+DEVICE = torch.device("cuda")
 
-# --- TensorRT 로거 설정 ---
+# --- TensorRT 로거 ---
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
-# --- 엔진 로드 클래스 ---
 class TensorRTInference:
     def __init__(self, engine_path):
         self.runtime = trt.Runtime(TRT_LOGGER)
@@ -23,69 +23,60 @@ class TensorRTInference:
             self.engine = self.runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
         
-        # 입출력 버퍼 할당
-        self.inputs = []
-        self.outputs = []
-        self.bindings = []
-        self.stream = cuda.Stream()
-
-        for binding in self.engine:
-            shape = self.engine.get_binding_shape(binding)
-            # 배치 사이즈가 -1(동적)인 경우 설정
-            if shape[0] == -1:
-                shape = (BATCH_SIZE, *shape[1:])
-            
-            size = trt.volume(shape)
-            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
-            
-            # 호스트(CPU) 메모리
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            # 디바이스(GPU) 메모리
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            
-            self.bindings.append(int(device_mem))
-            
-            if self.engine.binding_is_input(binding):
-                self.inputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
+        self.input_name = None
+        self.output_name = None
+        
+        # 입출력 이름 찾기
+        for i in range(self.engine.num_bindings):
+            name = self.engine.get_binding_name(i)
+            if self.engine.binding_is_input(i):
+                self.input_name = name
             else:
-                self.outputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
+                self.output_name = name
 
-    def infer(self, input_data):
-        # 1. 입력 데이터를 호스트 버퍼에 복사
-        np.copyto(self.inputs[0]['host'], input_data.ravel())
+    def infer(self, torch_input_tensor):
+        # [중요 1] 에러 해결: 동적 배치 크기 명시
+        # 현재 들어온 텐서의 모양을 컨텍스트에 설정해줍니다.
+        # (배치 사이즈가 32라면 (32, 3, 32, 32)로 설정됨)
+        self.context.set_binding_shape(0, tuple(torch_input_tensor.shape))
         
-        # 2. 호스트 -> 디바이스 전송 (비동기)
-        cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
+        # [중요 2] 출력 텐서 준비 (GPU 상에 바로 생성)
+        # TensorRT가 계산한 결과를 담을 빈 텐서를 GPU에 만듭니다.
+        # 출력 크기 계산: (Batch, 1000) -> MobileNetV3 기본 출력
+        # CIFAR10용으로 수정된 모델이라면 (Batch, 10)일 수 있으나, 
+        # 여기서는 안전하게 엔진의 출력 바인딩 크기를 참조합니다.
+        output_shape = tuple(self.context.get_binding_shape(1))
+        output_tensor = torch.empty(output_shape, device=DEVICE, dtype=torch.float16) # FP16 엔진이므로 float16
         
-        # 3. 추론 실행
-        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        # [중요 3] Zero-Copy: 메모리 주소(Pointer)만 넘김
+        # 데이터를 복사하지 않고, PyTorch 텐서의 메모리 주소를 TensorRT에게 알려줍니다.
+        bindings = [int(torch_input_tensor.data_ptr()), int(output_tensor.data_ptr())]
         
-        # 4. 디바이스 -> 호스트 전송 (비동기)
-        cuda.memcpy_dtoh_async(self.outputs[0]['host'], self.outputs[0]['device'], self.stream)
+        # 실행 (비동기)
+        self.context.execute_async_v2(bindings=bindings, stream_handle=torch.cuda.current_stream().cuda_stream)
         
-        # 5. 동기화 (완료 대기)
-        self.stream.synchronize()
-        
-        return self.outputs[0]['host']
+        return output_tensor
 
 # --- 데이터 준비 ---
 transform = T.Compose([
     T.ToTensor(),
     T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
-test_dataset = CIFAR10(root='./data', train=False, download=True, transform=transform)
-# drop_last=True: TensorRT는 배치 크기가 고정되어야 오류가 안 남
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, drop_last=True)
 
-# --- 엔진 초기화 ---
+# drop_last=True: 배치가 32로 딱 떨어지게 설정
+test_dataset = CIFAR10(root='./data', train=False, download=True, transform=transform)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, drop_last=True)
+
 print(f"TensorRT 엔진 로드 중: {ENGINE_PATH}")
 trt_model = TensorRTInference(ENGINE_PATH)
 
 # --- 워밍업 ---
 print("GPU 워밍업 중...")
-dummy_data = np.random.randn(BATCH_SIZE, 3, 32, 32).astype(np.float32)
-for _ in range(10):
-    trt_model.infer(dummy_data)
+# GPU 텐서를 바로 생성해서 워밍업
+dummy_input = torch.randn(BATCH_SIZE, 3, 32, 32, device=DEVICE, dtype=torch.float16) # FP16 입력
+for _ in range(50): # 충분히 워밍업
+    _ = trt_model.infer(dummy_input)
+torch.cuda.synchronize()
 print("워밍업 완료.")
 
 # --- 측정 시작 ---
@@ -93,23 +84,31 @@ print("측정 시작...")
 total_time = 0
 images_processed = 0
 
-# PyCUDA 시간 측정이 아닌 Python time 사용 (전체 파이프라인 시간)
-start_time = time.time()
+# 순수 연산 시간 측정을 위해 CUDA Event 사용
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
 
-for images, _ in test_loader:
-    # PyTorch Tensor -> Numpy 변환
-    input_numpy = images.numpy().astype(np.float32)
-    
-    # 추론
-    output = trt_model.infer(input_numpy)
-    
-    images_processed += BATCH_SIZE
+start_event.record()
 
-end_time = time.time()
-total_time = end_time - start_time
+with torch.no_grad():
+    for images, _ in test_loader:
+        # 1. 입력을 바로 GPU로 보내고 FP16으로 변환 (여기까지는 데이터 로딩 비용)
+        # memory_format=torch.channels_last는 TRT에서 자동으로 처리하므로 필수는 아니지만 도움될 수 있음
+        images = images.to(DEVICE).half()
+        
+        # 2. 추론 (Zero-Copy)
+        outputs = trt_model.infer(images)
+        
+        images_processed += BATCH_SIZE
 
-print(f"\n--- TensorRT(FP16) 측정 결과 ---")
+end_event.record()
+torch.cuda.synchronize()
+
+total_gpu_time_ms = start_event.elapsed_time(end_event)
+total_gpu_time_sec = total_gpu_time_ms / 1000.0
+
+print(f"\n--- TensorRT(FP16 + Zero-Copy) 측정 결과 ---")
 print(f"총 {images_processed}개 이미지 처리 완료.")
-print(f"총 소요 시간: {total_time:.4f} 초")
-print(f"이미지당 평균 처리 시간: {(total_time / images_processed) * 1000:.4f} ms")
-print(f"FPS: {images_processed / total_time:.2f}")
+print(f"총 소요 시간: {total_gpu_time_sec:.4f} 초")
+print(f"이미지당 평균 처리 시간: {(total_gpu_time_ms / images_processed):.4f} ms")
+print(f"FPS: {images_processed / total_gpu_time_sec:.2f}")
